@@ -1,31 +1,33 @@
 use std::cell::RefCell;
 use std::io::{self, Read, Write};
-use std::net::{IpAddr, Shutdown};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
-use std::rc::Rc;
 use std::str;
+use std::sync::Arc;
 use std::time::Duration;
 
-use futures::{future, Async, Future, Poll, Stream};
-use log::debug;
+use futures::{future, Future, Poll};
+use log::{debug, trace};
 use tokio::net::TcpStream;
-use tokio_io::io::{read_exact, write_all, Window};
-use tokio_io::{try_nb, AsyncRead, AsyncWrite};
+use tokio_io::io::{read_exact, write_all, Copy, Window};
+use tokio_io::{AsyncRead, AsyncWrite};
 use tokio_timer::Timeout;
-use trust_dns::client::{BasicClientHandle, ClientFuture, ClientHandle};
-use trust_dns::op::{Message, ResponseCode};
-use trust_dns::rr::{DNSClass, Name, RData, RecordType};
-use trust_dns::udp::UdpClientStream;
+use trust_dns_resolver::AsyncResolver;
 
-use crate::{v4, v5};
+use crate::v5;
 
 pub struct Connection {
-    buffer: Rc<RefCell<Vec<u8>>>,
-    dns: BasicClientHandle,
+    dns: AsyncResolver,
 }
 
 impl Connection {
-    pub fn serve(self, conn: TcpStream) -> impl Future<Item = (u64, u64), Error = io::Error> {
+    pub fn new(dns: AsyncResolver) -> Self {
+        Self { dns }
+    }
+
+    pub fn serve(
+        self,
+        conn: TcpStream,
+    ) -> impl Future<Item = (u64, u64), Error = io::Error> + 'static {
         read_exact(conn, [0u8]).and_then(|(conn, buf)| match buf[0] {
             v5::VERSION => future::Either::A(self.serve_v5(conn)),
             // v4::VERSION => future::Either::B(self.serve_v4(conn)),
@@ -33,7 +35,10 @@ impl Connection {
         })
     }
 
-    pub fn serve_v5(self, conn: TcpStream) -> impl Future<Item = (u64, u64), Error = io::Error> {
+    pub fn serve_v5(
+        self,
+        conn: TcpStream,
+    ) -> impl Future<Item = (u64, u64), Error = io::Error> + 'static {
         // First part of the SOCKSv5 protocol is to negotiate a number of
         // "methods". These methods can typically be used for various kinds of
         // proxy authentication and such, but for this server we only implement
@@ -99,7 +104,6 @@ impl Connection {
         //
         // Depending on the address type, we then delegate to different futures
         // to implement that particular address format.
-        let mut dns = self.dns.clone();
         let resv = command.and_then(|c| read_exact(c, [0u8]).map(|c| c.0));
         let atyp = resv.and_then(|c| read_exact(c, [0u8]));
         let addr = mybox(atyp.and_then(move |(c, buf)| {
@@ -164,12 +168,22 @@ impl Connection {
                                 Ok(UrlHost::Addr(addr)) => return mybox(future::ok((conn, addr))),
                                 Err(e) => return mybox(future::err(e)),
                             };
+                            debug!("received name and port: {}:{}", name, port);
 
-                            let ipv4 = dns
-                                .query(name, DNSClass::IN, RecordType::A)
+                            let ipv4 = self
+                                .dns
+                                .lookup_ip(name.as_str())
                                 .map_err(|e| other(&format!("dns error: {}", e)))
-                                .and_then(move |r| get_addr(r, port));
-                            mybox(ipv4.map(|addr| (conn, addr)))
+                                .and_then(move |r| {
+                                    r.iter()
+                                        .next()
+                                        .map(|addr| SocketAddr::new(addr, port))
+                                        .ok_or_else(|| other("no address records in response"))
+                                });
+                            mybox(ipv4.map(|addr| {
+                                debug!("received addr: {:?}", addr);
+                                (conn, addr)
+                            }))
                         }),
                 ),
 
@@ -294,15 +308,59 @@ impl Connection {
         // create two independent `Transfer` futures representing each half of
         // the connection. These two futures are `join`ed together to represent
         // the proxy operation happening.
-        let buffer = self.buffer.clone();
         mybox(pair.and_then(|(c1, c2)| {
-            let c1 = Rc::new(c1);
-            let c2 = Rc::new(c2);
+            let c1 = Arc::new(RefCell::new(c1));
+            let c2 = Arc::new(RefCell::new(c2));
 
-            let half1 = Transfer::new(c1.clone(), c2.clone(), buffer.clone());
-            let half2 = Transfer::new(c2, c1, buffer);
-            half1.join(half2)
+            let half1 = Blah::new(c1.clone(), c2.clone());
+            let half2 = Blah::new(c2, c1);
+            half1.join(half2).map(|((a1, _, _), (a2, _, _))| (a1, a2))
         }))
+    }
+}
+
+struct RcStream(Arc<RefCell<TcpStream>>);
+
+impl Read for RcStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.0.borrow_mut().read(buf)
+    }
+}
+
+impl Write for RcStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.borrow_mut().write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.borrow_mut().flush()
+    }
+}
+
+impl AsyncRead for RcStream {}
+impl AsyncWrite for RcStream {
+    fn shutdown(&mut self) -> Poll<(), io::Error> {
+        <&TcpStream>::shutdown(&mut &*self.0.borrow_mut())
+    }
+}
+
+struct Blah {
+    copy: Copy<RcStream, RcStream>,
+}
+
+impl Blah {
+    fn new(reader: Arc<RefCell<TcpStream>>, writer: Arc<RefCell<TcpStream>>) -> Self {
+        let copy = tokio_io::io::copy(RcStream(reader), RcStream(writer));
+        Self { copy }
+    }
+}
+
+impl Future for Blah {
+    type Item = (u64, RcStream, RcStream);
+    type Error = io::Error;
+
+    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        self.copy.poll()
     }
 }
 
@@ -314,110 +372,113 @@ impl Connection {
 /// This is intended to show off how the combinators are not all that can be
 /// done with futures, but rather more custom (or optimized) implementations can
 /// be implemented with just a trait impl!
-struct Transfer {
-    // The two I/O objects we'll be reading.
-    reader: Rc<TcpStream>,
-    writer: Rc<TcpStream>,
-
-    // The shared global buffer that all connections on our server are using.
-    buf: Rc<RefCell<Vec<u8>>>,
-
-    // The number of bytes we've written so far.
-    amt: u64,
-}
-
-impl Transfer {
-    fn new(reader: Rc<TcpStream>, writer: Rc<TcpStream>, buffer: Rc<RefCell<Vec<u8>>>) -> Transfer {
-        Transfer {
-            reader: reader,
-            writer: writer,
-            buf: buffer,
-            amt: 0,
-        }
-    }
-}
-
-// Here we implement the `Future` trait for `Transfer` directly. This does not
-// use any combinators, and shows how you might implement it in custom
-// situations if needed.
-impl Future for Transfer {
-    // Our future resolves to the number of bytes transferred, or an I/O error
-    // that happens during the connection, if any.
-    type Item = u64;
-    type Error = io::Error;
-
-    /// Attempts to drive this future to completion, checking if it's ready to
-    /// be completed.
-    ///
-    /// This method is the core foundation of completing a future over time. It
-    /// is intended to never block and return "quickly" to ensure that it
-    /// doesn't block the event loop.
-    ///
-    /// Completion for our `Transfer` future is defined when one side hits EOF
-    /// and we've written all remaining data to the other side of the
-    /// connection. The behavior of `Future::poll` is in general not specified
-    /// after a future resolves (e.g. in this case returns an error or how many
-    /// bytes were transferred), so we don't need to maintain state beyond that
-    /// point.
-    fn poll(&mut self) -> Poll<u64, io::Error> {
-        let mut buffer = self.buf.borrow_mut();
-
-        // Here we loop over the two TCP halves, reading all data from one
-        // connection and writing it to another. The crucial performance aspect
-        // of this server, however, is that we wait until both the read half and
-        // the write half are ready on the connection, allowing the buffer to
-        // only be temporarily used in a small window for all connections.
-        loop {
-            let read_ready = self.reader.poll_read().is_ready();
-            let write_ready = self.writer.poll_write().is_ready();
-            if !read_ready || !write_ready {
-                return Ok(Async::NotReady);
-            }
-
-            // TODO: This exact logic for reading/writing amounts may need an
-            //       update
-            //
-            // Right now the `buffer` is actually pretty big, 64k, and it could
-            // be the case that one end of the connection can far outpace
-            // another. For example we may be able to always read 64k from the
-            // read half but only be able to write 5k to the client. This is a
-            // pretty bad situation because we've got data in a buffer that's
-            // intended to be ephemeral!
-            //
-            // Ideally here we'd actually adapt the rate of reads to match the
-            // rate of writes. That is, we'd prefer to have some form of
-            // adaptive algorithm which keeps track of how many bytes are
-            // written and match the read rate to the write rate. It's possible
-            // for connections to have an even smaller (and optional) buffer on
-            // the side representing the "too much data they read" if that
-            // happens, and then the next call to `read` could compensate by not
-            // reading so much again.
-            //
-            // In any case, though, this is easily implementable in terms of
-            // adding fields to `Transfer` and is complicated enough to
-            // otherwise detract from the example in question here. As a result,
-            // we simply read into the global buffer and then assert that we
-            // write out exactly the same amount.
-            //
-            // This means that we may trip the assert below, but it should be
-            // relatively easily fixable with the strategy above!
-
-            let n = try_nb!((&*self.reader).read(&mut buffer));
-            if n == 0 {
-                self.writer.shutdown(Shutdown::Write)?;
-                return Ok(self.amt.into());
-            }
-            self.amt += n as u64;
-
-            // Unlike above, we don't handle `WouldBlock` specially, because
-            // that would play into the logic mentioned above (tracking read
-            // rates and write rates), so we just ferry along that error for
-            // now.
-            let m = (&*self.writer).write(&buffer[..n])?;
-            assert_eq!(n, m);
-        }
-    }
-}
+// struct Transfer {
+//     // The two I/O objects we'll be reading.
+//     reader: Rc<TcpStream>,
+//     writer: Rc<TcpStream>,
+//
+//     // The shared global buffer that all connections on our server are using.
+//     buf: Rc<RefCell<Vec<u8>>>,
+//
+//     // The number of bytes we've written so far.
+//     amt: u64,
+// }
+//
+// impl Transfer {
+//     fn new(reader: Rc<TcpStream>, writer: Rc<TcpStream>, buffer: Rc<RefCell<Vec<u8>>>) -> Transfer {
+//         Transfer {
+//             reader: reader,
+//             writer: writer,
+//             buf: buffer,
+//             amt: 0,
+//         }
+//     }
+// }
+//
+// // Here we implement the `Future` trait for `Transfer` directly. This does not
+// // use any combinators, and shows how you might implement it in custom
+// // situations if needed.
+// impl Future for Transfer {
+//     // Our future resolves to the number of bytes transferred, or an I/O error
+//     // that happens during the connection, if any.
+//     type Item = u64;
+//     type Error = io::Error;
+//
+//     /// Attempts to drive this future to completion, checking if it's ready to
+//     /// be completed.
+//     ///
+//     /// This method is the core foundation of completing a future over time. It
+//     /// is intended to never block and return "quickly" to ensure that it
+//     /// doesn't block the event loop.
+//     ///
+//     /// Completion for our `Transfer` future is defined when one side hits EOF
+//     /// and we've written all remaining data to the other side of the
+//     /// connection. The behavior of `Future::poll` is in general not specified
+//     /// after a future resolves (e.g. in this case returns an error or how many
+//     /// bytes were transferred), so we don't need to maintain state beyond that
+//     /// point.
+//     fn poll(&mut self) -> Poll<u64, io::Error> {
+//         // Remove me
+//         Ok(Async::NotReady)
+//         //
+//         // let mut buffer = self.buf.borrow_mut();
+//         //
+//         // // Here we loop over the two TCP halves, reading all data from one
+//         // // connection and writing it to another. The crucial performance aspect
+//         // // of this server, however, is that we wait until both the read half and
+//         // // the write half are ready on the connection, allowing the buffer to
+//         // // only be temporarily used in a small window for all connections.
+//         // loop {
+//         //     let read_ready = self.reader.poll_read().is_ready();
+//         //     let write_ready = self.writer.poll_write().is_ready();
+//         //     if !read_ready || !write_ready {
+//         //         return Ok(Async::NotReady);
+//         //     }
+//         //
+//         //     // TODO: This exact logic for reading/writing amounts may need an
+//         //     //       update
+//         //     //
+//         //     // Right now the `buffer` is actually pretty big, 64k, and it could
+//         //     // be the case that one end of the connection can far outpace
+//         //     // another. For example we may be able to always read 64k from the
+//         //     // read half but only be able to write 5k to the client. This is a
+//         //     // pretty bad situation because we've got data in a buffer that's
+//         //     // intended to be ephemeral!
+//         //     //
+//         //     // Ideally here we'd actually adapt the rate of reads to match the
+//         //     // rate of writes. That is, we'd prefer to have some form of
+//         //     // adaptive algorithm which keeps track of how many bytes are
+//         //     // written and match the read rate to the write rate. It's possible
+//         //     // for connections to have an even smaller (and optional) buffer on
+//         //     // the side representing the "too much data they read" if that
+//         //     // happens, and then the next call to `read` could compensate by not
+//         //     // reading so much again.
+//         //     //
+//         //     // In any case, though, this is easily implementable in terms of
+//         //     // adding fields to `Transfer` and is complicated enough to
+//         //     // otherwise detract from the example in question here. As a result,
+//         //     // we simply read into the global buffer and then assert that we
+//         //     // write out exactly the same amount.
+//         //     //
+//         //     // This means that we may trip the assert below, but it should be
+//         //     // relatively easily fixable with the strategy above!
+//         //
+//         //     let n = try_nb!((&*self.reader).read(&mut buffer));
+//         //     if n == 0 {
+//         //         self.writer.shutdown(Shutdown::Write)?;
+//         //         return Ok(self.amt.into());
+//         //     }
+//         //     self.amt += n as u64;
+//         //
+//         //     // Unlike above, we don't handle `WouldBlock` specially, because
+//         //     // that would play into the logic mentioned above (tracking read
+//         //     // rates and write rates), so we just ferry along that error for
+//         //     // now.
+//         //     let m = (&*self.writer).write(&buffer[..n])?;
+//         //     assert_eq!(n, m);
+//         // }
+//     }
+// }
 
 fn mybox<F: Future + 'static>(f: F) -> Box<Future<Item = F::Item, Error = F::Error>> {
     Box::new(f)
@@ -428,7 +489,7 @@ fn other(desc: &str) -> io::Error {
 }
 
 enum UrlHost {
-    Name(Name, u16),
+    Name(String, u16),
     Addr(SocketAddr),
 }
 
@@ -449,28 +510,5 @@ fn name_port(addr_buf: &[u8]) -> io::Result<UrlHost> {
     if let Ok(ip) = hostname.parse() {
         return Ok(UrlHost::Addr(SocketAddr::new(ip, port)));
     }
-    let name = Name::parse(hostname, Some(&Name::root()))
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-    Ok(UrlHost::Name(name, port))
-}
-
-// Extracts the first IP address from the response.
-fn get_addr(response: Message, port: u16) -> io::Result<SocketAddr> {
-    if response.get_response_code() != ResponseCode::NoError {
-        return Err(other("resolution failed"));
-    }
-    let addr = response
-        .get_answers()
-        .iter()
-        .filter_map(|ans| match *ans.get_rdata() {
-            RData::A(addr) => Some(IpAddr::V4(addr)),
-            RData::AAAA(addr) => Some(IpAddr::V6(addr)),
-            _ => None,
-        })
-        .next();
-
-    match addr {
-        Some(addr) => Ok(SocketAddr::new(addr, port)),
-        None => Err(other("no address records in response")),
-    }
+    Ok(UrlHost::Name(hostname.to_string(), port))
 }
