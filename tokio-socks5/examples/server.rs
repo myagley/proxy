@@ -1,11 +1,10 @@
 use std::env;
 use std::net::SocketAddr;
 
-use futures::{future, Future, Stream};
+use futures::{Future, Stream};
 use tokio::net::TcpListener;
 use tokio::runtime::current_thread;
 use tokio_socks5::server::Connection;
-use trust_dns_resolver::config::*;
 use trust_dns_resolver::AsyncResolver;
 
 fn main() {
@@ -39,7 +38,6 @@ fn main() {
     // progress concurrently with all other connections.
     println!("Listening for socks5 proxy connections on {}", addr);
     let connections = listener.incoming().map(move |socket| {
-        println!("conn");
         let connection = Connection::new(resolver.clone());
         connection.serve(socket)
     });
