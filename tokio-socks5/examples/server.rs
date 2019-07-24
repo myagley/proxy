@@ -5,7 +5,6 @@ use std::sync::Arc;
 
 use futures::{future, Future, Poll, Stream};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::runtime::current_thread;
 use tokio_io::io::{copy, shutdown};
 use tokio_io::{AsyncRead, AsyncWrite};
 use tokio_socks5::server::{self, Destination};
@@ -81,7 +80,7 @@ fn main() {
                     }
                     Ok(())
                 });
-            Ok(current_thread::spawn(connection))
+            tokio::spawn(connection)
         });
 
     // Now that we've got our server as a future ready to go, let's run it!
@@ -89,7 +88,7 @@ fn main() {
     // This `run` method will return the resolution of the future itself, but
     // our `server` futures will resolve to `io::Result<()>`, so we just want to
     // assert that it didn't hit an error.
-    current_thread::run(serve.join(background).map(|_| ()));
+    tokio::run(serve.join(background).map(drop));
 }
 
 fn resolve_addr(

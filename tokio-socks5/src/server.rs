@@ -68,7 +68,7 @@ fn name_port(addr_buf: &[u8]) -> io::Result<Destination> {
     Ok(Destination::Name(hostname.to_string(), port))
 }
 
-pub struct Handshake<T>(Box<dyn Future<Item = ConnectionRequest<T>, Error = io::Error>>);
+pub struct Handshake<T>(Box<dyn Future<Item = ConnectionRequest<T>, Error = io::Error> + Send>);
 
 impl<T> Future for Handshake<T>
 where
@@ -94,7 +94,7 @@ where
     Handshake(Box::new(request))
 }
 
-fn handshake_v5<T>(io: T) -> impl Future<Item = ConnectionRequest<T>, Error = io::Error>
+fn handshake_v5<T>(io: T) -> impl Future<Item = ConnectionRequest<T>, Error = io::Error> + Send
 where
     T: AsyncRead + AsyncWrite + Send + 'static,
 {
@@ -238,7 +238,9 @@ where
     Box::new(request)
 }
 
-fn mybox2<F: Future + 'static>(f: F) -> Box<Future<Item = F::Item, Error = F::Error>> {
+fn mybox2<F: Future + Send + 'static>(
+    f: F,
+) -> Box<dyn Future<Item = F::Item, Error = F::Error> + Send> {
     Box::new(f)
 }
 
@@ -255,10 +257,10 @@ impl<T> ConnectionRequest<T> {
 
 impl<T> ConnectionRequest<T>
 where
-    T: AsyncRead + AsyncWrite,
+    T: AsyncRead + AsyncWrite + Send,
 {
     // need to add a reject
-    pub fn accept(self, outgoing: &SocketAddr) -> impl Future<Item = T, Error = io::Error> {
+    pub fn accept(self, outgoing: &SocketAddr) -> impl Future<Item = T, Error = io::Error> + Send {
         debug!("connected to {}, sending socks5 reply", outgoing);
         let mut resp = [0u8; 32];
 
