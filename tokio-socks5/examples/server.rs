@@ -1,10 +1,14 @@
 use std::env;
-use std::net::SocketAddr;
+use std::io::{self, Read, Write};
+use std::net::{Shutdown, SocketAddr};
+use std::sync::Arc;
 
-use futures::{Future, Stream};
-use tokio::net::TcpListener;
+use futures::{future, Future, Poll, Stream};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::runtime::current_thread;
-use tokio_socks5::server::Connection;
+use tokio_io::io::{copy, shutdown};
+use tokio_io::{AsyncRead, AsyncWrite};
+use tokio_socks5::server::{self, Destination};
 use trust_dns_resolver::AsyncResolver;
 
 fn main() {
@@ -37,27 +41,111 @@ fn main() {
     // itself is then *spawned* onto the event loop to ensure that it can
     // progress concurrently with all other connections.
     println!("Listening for socks5 proxy connections on {}", addr);
-    let connections = listener.incoming().map(move |socket| {
-        let connection = Connection::new(resolver.clone());
-        connection.serve(socket)
-    });
-    let server = connections
-        .for_each(move |connection| {
-            let handle_conn = connection.then(move |res| {
-                match res {
-                    Ok((a, b)) => println!("proxied {}/{} bytes for blah", a, b),
-                    Err(e) => println!("error for blah: {}", e),
-                };
-                Ok(())
-            });
-            Ok(current_thread::spawn(handle_conn))
-        })
-        .map_err(drop);
+    let serve = listener
+        .incoming()
+        .map_err(|e| eprintln!("accept failed = {:?}", e))
+        .for_each(move |socket| {
+            let resolver = resolver.clone();
+            let connection = server::handshake(socket)
+                .and_then(|request| {
+                    let addr = resolve_addr(resolver, request.destination());
+
+                    // need to add connect timeout
+                    addr.and_then(|addr| TcpStream::connect(&addr))
+                        .and_then(move |server| {
+                            request
+                                .accept(&server.peer_addr().unwrap())
+                                .map(|client| (client, server))
+                        })
+                        .and_then(|(client, server)| {
+                            let client_reader = RcStream(Arc::new(client));
+                            let client_writer = client_reader.clone();
+                            let server_reader = RcStream(Arc::new(server));
+                            let server_writer = server_reader.clone();
+
+                            let client_to_server = copy(client_reader, server_writer).and_then(
+                                |(n, _, server_writer)| shutdown(server_writer).map(move |_| n),
+                            );
+
+                            let server_to_client = copy(server_reader, client_writer).and_then(
+                                |(n, _, client_writer)| shutdown(client_writer).map(move |_| n),
+                            );
+
+                            client_to_server.join(server_to_client)
+                        })
+                })
+                .then(|result| {
+                    match result {
+                        Ok((a, b)) => println!("proxied {}/{} for connection", a, b),
+                        Err(e) => println!("error for connection: {}", e),
+                    }
+                    Ok(())
+                });
+            Ok(current_thread::spawn(connection))
+        });
 
     // Now that we've got our server as a future ready to go, let's run it!
     //
     // This `run` method will return the resolution of the future itself, but
     // our `server` futures will resolve to `io::Result<()>`, so we just want to
     // assert that it didn't hit an error.
-    current_thread::run(server.join(background).map(|_| ()));
+    current_thread::run(serve.join(background).map(|_| ()));
+}
+
+fn resolve_addr(
+    resolver: AsyncResolver,
+    dest: &Destination,
+) -> impl Future<Item = SocketAddr, Error = io::Error> + Send + 'static {
+    match dest {
+        Destination::Name(name, port) => {
+            let n = name.to_owned();
+            let p = port.clone();
+            let f = resolver
+                .lookup_ip(n.as_str())
+                .map_err(|e| other(&format!("dns error: {}", e)))
+                .and_then(move |r| {
+                    let res: Result<SocketAddr, io::Error> = r
+                        .iter()
+                        .next()
+                        .map(|a| SocketAddr::new(a, p))
+                        .ok_or_else(|| other("no address records in response"));
+                    res
+                })
+                .map_err(|_| other("b;ah"));
+            future::Either::A(f)
+        }
+        Destination::Addr(addr) => future::Either::B(future::ok(addr.clone())),
+    }
+}
+
+#[derive(Clone)]
+struct RcStream(Arc<TcpStream>);
+
+impl Read for RcStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        (&*self.0).read(buf)
+    }
+}
+
+impl Write for RcStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        (&*self.0).write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        (&*self.0).flush()
+    }
+}
+
+impl AsyncRead for RcStream {}
+
+impl AsyncWrite for RcStream {
+    fn shutdown(&mut self) -> Poll<(), io::Error> {
+        self.0.shutdown(Shutdown::Write)?;
+        Ok(().into())
+    }
+}
+
+fn other(desc: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::Other, desc)
 }
