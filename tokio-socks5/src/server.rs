@@ -43,6 +43,12 @@ fn other(desc: &str) -> io::Error {
     io::Error::new(io::ErrorKind::Other, desc)
 }
 
+fn boxed<F: Future + Send + 'static>(
+    f: F,
+) -> Box<dyn Future<Item = F::Item, Error = F::Error> + Send> {
+    Box::new(f)
+}
+
 pub enum Destination {
     Name(String, u16),
     Addr(SocketAddr),
@@ -169,7 +175,7 @@ where
         match buf[0] {
             // For IPv4 addresses, we read the 4 bytes for the address as
             // well as 2 bytes for the port.
-            v5::ATYP_IPV4 => mybox2(read_exact(c, [0u8; 6]).map(|(io, buf)| {
+            v5::ATYP_IPV4 => boxed(read_exact(c, [0u8; 6]).map(|(io, buf)| {
                 let addr = Ipv4Addr::new(buf[0], buf[1], buf[2], buf[3]);
                 let port = ((buf[4] as u16) << 8) | (buf[5] as u16);
                 let addr = SocketAddrV4::new(addr, port);
@@ -179,7 +185,7 @@ where
 
             // For IPv6 addresses there's 16 bytes of an address plus two
             // bytes for a port, so we read that off and then keep going.
-            v5::ATYP_IPV6 => mybox2(read_exact(c, [0u8; 18]).map(|(io, buf)| {
+            v5::ATYP_IPV6 => boxed(read_exact(c, [0u8; 18]).map(|(io, buf)| {
                 let a = ((buf[0] as u16) << 8) | (buf[1] as u16);
                 let b = ((buf[2] as u16) << 8) | (buf[3] as u16);
                 let c = ((buf[4] as u16) << 8) | (buf[5] as u16);
@@ -220,7 +226,7 @@ where
             // stub resolver, such as sorting of answers according to RFC
             // 6724, more robust timeout handling, or resolving CNAME
             // lookups.
-            v5::ATYP_DOMAIN => mybox2(
+            v5::ATYP_DOMAIN => boxed(
                 read_exact(c, [0u8])
                     .and_then(|(conn, buf)| read_exact(conn, vec![0u8; buf[0] as usize + 2]))
                     .and_then(move |(io, buf)| {
@@ -231,17 +237,11 @@ where
 
             n => {
                 let msg = format!("unknown ATYP received: {}", n);
-                mybox2(future::err(other(&msg)))
+                boxed(future::err(other(&msg)))
             }
         }
     });
     Box::new(request)
-}
-
-fn mybox2<F: Future + Send + 'static>(
-    f: F,
-) -> Box<dyn Future<Item = F::Item, Error = F::Error> + Send> {
-    Box::new(f)
 }
 
 pub struct ConnectionRequest<T> {
@@ -320,137 +320,3 @@ where
         })
     }
 }
-
-//
-// // Now that we've got a socket address to connect to, let's actually
-// // create a connection to that socket!
-// //
-// // To do this, we use our `handle` field, a handle to the event loop, to
-// // issue a connection to the address we've figured out we're going to
-// // connect to. Note that this `tcp_connect` method itself returns a
-// // future resolving to a `TcpStream`, representing how long it takes to
-// // initiate a TCP connection to the remote.
-// //
-// // We wait for the TCP connect to get fully resolved before progressing
-// // to the next stage of the SOCKSv5 handshake, but we keep ahold of any
-// // possible error in the connection phase to handle it in a moment.
-// let connected = mybox(addr.and_then(move |(c, addr)| {
-//     debug!("proxying to {}", addr);
-//     TcpStream::connect(&addr).then(move |c2| Ok((c, c2, addr)))
-// }));
-//
-// // Once we've gotten to this point, we're ready for the final part of
-// // the SOCKSv5 handshake. We've got in our hands (c2) the client we're
-// // going to proxy data to, so we write out relevant information to the
-// // original client (c1) the "response packet" which is the final part of
-// // this handshake.
-// let handshake_finish = mybox(connected.and_then(|(c1, c2, addr)| {
-//     debug!("connected to {}, sending socks5 reply", addr);
-//     let mut resp = [0u8; 32];
-//
-//     // VER - protocol version
-//     resp[0] = 5;
-//
-//     // REP - "reply field" -- what happened with the actual connect.
-//     //
-//     // In theory this should reply back with a bunch more kinds of
-//     // errors if possible, but for now we just recognize a few concrete
-//     // errors.
-//     resp[1] = match c2 {
-//         Ok(..) => 0,
-//         Err(ref e) if e.kind() == io::ErrorKind::ConnectionRefused => 5,
-//         Err(..) => 1,
-//     };
-//
-//     // RSV - reserved
-//     resp[2] = 0;
-//
-//     // ATYP, BND.ADDR, and BND.PORT
-//     //
-//     // These three fields, when used with a "connect" command
-//     // (determined above), indicate the address that our proxy
-//     // connection was bound to remotely. There's a variable length
-//     // encoding of what's actually written depending on whether we're
-//     // using an IPv4 or IPv6 address, but otherwise it's pretty
-//     // standard.
-//     let addr = match c2.as_ref().map(|r| r.local_addr()) {
-//         Ok(Ok(addr)) => addr,
-//         Ok(Err(..)) | Err(..) => addr,
-//     };
-//     let pos = match addr {
-//         SocketAddr::V4(ref a) => {
-//             resp[3] = 1;
-//             resp[4..8].copy_from_slice(&a.ip().octets()[..]);
-//             8
-//         }
-//         SocketAddr::V6(ref a) => {
-//             resp[3] = 4;
-//             let mut pos = 4;
-//             for &segment in a.ip().segments().iter() {
-//                 resp[pos] = (segment >> 8) as u8;
-//                 resp[pos + 1] = segment as u8;
-//                 pos += 2;
-//             }
-//             pos
-//         }
-//     };
-//     resp[pos] = (addr.port() >> 8) as u8;
-//     resp[pos + 1] = addr.port() as u8;
-//
-//     // Slice our 32-byte `resp` buffer to the actual size, as it's
-//     // variable depending on what address we just encoding. Once that's
-//     // done, write out the whole buffer to our client.
-//     //
-//     // The returned type of the future here will be `(TcpStream,
-//     // TcpStream)` representing the client half and the proxy half of
-//     // the connection.
-//     let mut w = Window::new(resp);
-//     w.set_end(pos + 2);
-//     write_all(c1, w).and_then(|(c1, _)| {
-//         debug!("successfully sent socks5 reply");
-//         c2.map(|c2| (c1, c2))
-//     })
-// }));
-//
-// // Phew! If you've gotten this far, then we're now entirely done with
-// // the entire SOCKSv5 handshake!
-// //
-// // In order to handle ill-behaved clients, however, we have an added
-// // feature here where we'll time out any initial connect operations
-// // which take too long.
-// //
-// // Here we create a timeout future, using the `Timeout::new` method,
-// // which will create a future that will resolve to `()` in 10 seconds.
-// // We then apply this timeout to the entire handshake all at once by
-// // performing a `select` between the timeout and the handshake itself.
-//
-// let pair = mybox(
-//     Timeout::new(handshake_finish, Duration::new(10, 0)).map_err(|_| other("timeout")),
-// );
-//
-// // At this point we've *actually* finished the handshake. Not only have
-// // we read/written all the relevant bytes, but we've also managed to
-// // complete in under our allotted timeout.
-// //
-// // At this point the remainder of the SOCKSv5 proxy is shuttle data back
-// // and for between the two connections. That is, data is read from `c1`
-// // and written to `c2`, and vice versa.
-// //
-// // To accomplish this, we put both sockets into their own `Rc` and then
-// // create two independent `Transfer` futures representing each half of
-// // the connection. These two futures are `join`ed together to represent
-// // the proxy operation happening.
-// mybox(pair.and_then(|(client, server)| {
-//     let client_reader = RcStream(Arc::new(client));
-//     let client_writer = client_reader.clone();
-//     let server_reader = RcStream(Arc::new(server));
-//     let server_writer = server_reader.clone();
-//
-//     let client_to_server = copy(client_reader, server_writer)
-//         .and_then(|(n, _, server_writer)| shutdown(server_writer).map(move |_| n));
-//
-//     let server_to_client = copy(server_reader, client_writer)
-//         .and_then(|(n, _, client_writer)| shutdown(client_writer).map(move |_| n));
-//
-//     client_to_server.join(server_to_client)
-// }))
