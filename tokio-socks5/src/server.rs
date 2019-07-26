@@ -1,38 +1,77 @@
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::str;
-use std::sync::Arc;
 
 use futures::{future, Future, Poll};
 use log::debug;
+use tokio::net::unix::{UnixDatagram, UnixStream};
 use tokio::net::TcpStream;
 use tokio_io::io::{read_exact, write_all, Window};
 use tokio_io::{AsyncRead, AsyncWrite};
 
 use crate::v5;
 
-#[derive(Clone)]
-struct RcStream(Arc<TcpStream>);
+pub trait ProxiedShutdown {
+    fn shutdown(&self, how: Shutdown) -> io::Result<()>;
+}
 
-impl Read for RcStream {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        (&*self.0).read(buf)
+impl ProxiedShutdown for TcpStream {
+    fn shutdown(&self, how: Shutdown) -> io::Result<()> {
+        self.shutdown(how)
     }
 }
 
-impl Write for RcStream {
+impl ProxiedShutdown for UnixDatagram {
+    fn shutdown(&self, how: Shutdown) -> io::Result<()> {
+        self.shutdown(how)
+    }
+}
+
+impl ProxiedShutdown for UnixStream {
+    fn shutdown(&self, how: Shutdown) -> io::Result<()> {
+        self.shutdown(how)
+    }
+}
+
+pub struct ProxiedIo<T>(T);
+
+impl<T> ProxiedIo<T> {
+    pub fn new(io: T) -> Self {
+        Self(io)
+    }
+
+    pub fn get_ref(&self) -> &T {
+        &self.0
+    }
+
+    pub fn get_mut(&mut self) -> &mut T {
+        &mut self.0
+    }
+
+    pub fn into_inner(self) -> T {
+        self.0
+    }
+}
+
+impl<T: Read> Read for ProxiedIo<T> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.0.read(buf)
+    }
+}
+
+impl<T: Write> Write for ProxiedIo<T> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        (&*self.0).write(buf)
+        self.0.write(buf)
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        (&*self.0).flush()
+        self.0.flush()
     }
 }
 
-impl AsyncRead for RcStream {}
+impl<T: AsyncRead> AsyncRead for ProxiedIo<T> {}
 
-impl AsyncWrite for RcStream {
+impl<T: AsyncWrite + ProxiedShutdown> AsyncWrite for ProxiedIo<T> {
     fn shutdown(&mut self) -> Poll<(), io::Error> {
         self.0.shutdown(Shutdown::Write)?;
         Ok(().into())

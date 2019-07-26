@@ -1,13 +1,12 @@
 use std::env;
-use std::io::{self, Read, Write};
-use std::net::{Shutdown, SocketAddr};
-use std::sync::Arc;
+use std::io;
+use std::net::SocketAddr;
 
-use futures::{future, Future, Poll, Stream};
+use futures::{future, Future, Stream};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_io::io::{copy, shutdown};
-use tokio_io::{AsyncRead, AsyncWrite};
-use tokio_socks5::server::{self, Destination};
+use tokio_io::AsyncRead;
+use tokio_socks5::server::{self, Destination, ProxiedIo};
 use trust_dns_resolver::AsyncResolver;
 
 fn main() {
@@ -47,20 +46,20 @@ fn main() {
             let resolver = resolver.clone();
             let connection = server::handshake(socket)
                 .and_then(|request| {
-                    let addr = resolve_addr(resolver, request.destination());
-
                     // need to add connect timeout
-                    addr.and_then(|addr| TcpStream::connect(&addr))
+                    resolve_addr(resolver, request.destination())
+                        .and_then(|addr| TcpStream::connect(&addr))
                         .and_then(move |server| {
                             request
                                 .accept(&server.peer_addr().unwrap())
                                 .map(|client| (client, server))
                         })
                         .and_then(|(client, server)| {
-                            let client_reader = RcStream(Arc::new(client));
-                            let client_writer = client_reader.clone();
-                            let server_reader = RcStream(Arc::new(server));
-                            let server_writer = server_reader.clone();
+                            let client = ProxiedIo::new(client);
+                            let server = ProxiedIo::new(server);
+
+                            let (client_reader, client_writer) = client.split();
+                            let (server_reader, server_writer) = server.split();
 
                             let client_to_server = copy(client_reader, server_writer).and_then(
                                 |(n, _, server_writer)| shutdown(server_writer).map(move |_| n),
@@ -114,34 +113,6 @@ fn resolve_addr(
             future::Either::A(f)
         }
         Destination::Addr(addr) => future::Either::B(future::ok(addr.clone())),
-    }
-}
-
-#[derive(Clone)]
-struct RcStream(Arc<TcpStream>);
-
-impl Read for RcStream {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        (&*self.0).read(buf)
-    }
-}
-
-impl Write for RcStream {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        (&*self.0).write(buf)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        (&*self.0).flush()
-    }
-}
-
-impl AsyncRead for RcStream {}
-
-impl AsyncWrite for RcStream {
-    fn shutdown(&mut self) -> Poll<(), io::Error> {
-        self.0.shutdown(Shutdown::Write)?;
-        Ok(().into())
     }
 }
 
