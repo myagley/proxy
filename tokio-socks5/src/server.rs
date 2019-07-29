@@ -82,12 +82,6 @@ fn other(desc: &str) -> io::Error {
     io::Error::new(io::ErrorKind::Other, desc)
 }
 
-fn boxed<F: Future + Send + 'static>(
-    f: F,
-) -> Box<dyn Future<Item = F::Item, Error = F::Error> + Send> {
-    Box::new(f)
-}
-
 pub enum Destination {
     Name(String, u16),
     Addr(SocketAddr),
@@ -214,31 +208,35 @@ where
         match buf[0] {
             // For IPv4 addresses, we read the 4 bytes for the address as
             // well as 2 bytes for the port.
-            v5::ATYP_IPV4 => boxed(read_exact(c, [0u8; 6]).map(|(io, buf)| {
-                let addr = Ipv4Addr::new(buf[0], buf[1], buf[2], buf[3]);
-                let port = ((buf[4] as u16) << 8) | (buf[5] as u16);
-                let addr = SocketAddrV4::new(addr, port);
-                let destination = Destination::Addr(SocketAddr::V4(addr));
-                ConnectionRequest { io, destination }
-            })),
+            v5::ATYP_IPV4 => future::Either::A(future::Either::A(read_exact(c, [0u8; 6]).map(
+                |(io, buf)| {
+                    let addr = Ipv4Addr::new(buf[0], buf[1], buf[2], buf[3]);
+                    let port = ((buf[4] as u16) << 8) | (buf[5] as u16);
+                    let addr = SocketAddrV4::new(addr, port);
+                    let destination = Destination::Addr(SocketAddr::V4(addr));
+                    ConnectionRequest { io, destination }
+                },
+            ))),
 
             // For IPv6 addresses there's 16 bytes of an address plus two
             // bytes for a port, so we read that off and then keep going.
-            v5::ATYP_IPV6 => boxed(read_exact(c, [0u8; 18]).map(|(io, buf)| {
-                let a = ((buf[0] as u16) << 8) | (buf[1] as u16);
-                let b = ((buf[2] as u16) << 8) | (buf[3] as u16);
-                let c = ((buf[4] as u16) << 8) | (buf[5] as u16);
-                let d = ((buf[6] as u16) << 8) | (buf[7] as u16);
-                let e = ((buf[8] as u16) << 8) | (buf[9] as u16);
-                let f = ((buf[10] as u16) << 8) | (buf[11] as u16);
-                let g = ((buf[12] as u16) << 8) | (buf[13] as u16);
-                let h = ((buf[14] as u16) << 8) | (buf[15] as u16);
-                let addr = Ipv6Addr::new(a, b, c, d, e, f, g, h);
-                let port = ((buf[16] as u16) << 8) | (buf[17] as u16);
-                let addr = SocketAddrV6::new(addr, port, 0, 0);
-                let destination = Destination::Addr(SocketAddr::V6(addr));
-                ConnectionRequest { io, destination }
-            })),
+            v5::ATYP_IPV6 => future::Either::A(future::Either::B(read_exact(c, [0u8; 18]).map(
+                |(io, buf)| {
+                    let a = ((buf[0] as u16) << 8) | (buf[1] as u16);
+                    let b = ((buf[2] as u16) << 8) | (buf[3] as u16);
+                    let c = ((buf[4] as u16) << 8) | (buf[5] as u16);
+                    let d = ((buf[6] as u16) << 8) | (buf[7] as u16);
+                    let e = ((buf[8] as u16) << 8) | (buf[9] as u16);
+                    let f = ((buf[10] as u16) << 8) | (buf[11] as u16);
+                    let g = ((buf[12] as u16) << 8) | (buf[13] as u16);
+                    let h = ((buf[14] as u16) << 8) | (buf[15] as u16);
+                    let addr = Ipv6Addr::new(a, b, c, d, e, f, g, h);
+                    let port = ((buf[16] as u16) << 8) | (buf[17] as u16);
+                    let addr = SocketAddrV6::new(addr, port, 0, 0);
+                    let destination = Destination::Addr(SocketAddr::V6(addr));
+                    ConnectionRequest { io, destination }
+                },
+            ))),
 
             // The SOCKSv5 protocol not only supports proxying to specific
             // IP addresses, but also arbitrary hostnames. This allows
@@ -265,22 +263,22 @@ where
             // stub resolver, such as sorting of answers according to RFC
             // 6724, more robust timeout handling, or resolving CNAME
             // lookups.
-            v5::ATYP_DOMAIN => boxed(
+            v5::ATYP_DOMAIN => future::Either::B(future::Either::A(
                 read_exact(c, [0u8])
                     .and_then(|(conn, buf)| read_exact(conn, vec![0u8; buf[0] as usize + 2]))
                     .and_then(move |(io, buf)| {
                         name_port(&buf)
                             .map(move |destination| ConnectionRequest { io, destination })
                     }),
-            ),
+            )),
 
             n => {
                 let msg = format!("unknown ATYP received: {}", n);
-                boxed(future::err(other(&msg)))
+                future::Either::B(future::Either::B(future::err(other(&msg))))
             }
         }
     });
-    Box::new(request)
+    request
 }
 
 pub struct ConnectionRequest<T> {
